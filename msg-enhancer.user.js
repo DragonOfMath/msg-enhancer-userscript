@@ -2,7 +2,7 @@
 // @author      DragonOfMath
 // @name        MSG Enhancer
 // @description Adds vote & fave buttons to index pages
-// @version     1.2
+// @version     1.6
 // @grant       GM.getValue
 // @grant       GM.setValue
 // @grant       GM.deleteValue
@@ -15,9 +15,17 @@ Changelog:
 1.0 - Release
 1.1 - Direct download added, arrow buttons widened
 1.2 - Downvoting fixed, page injection reworked, IIFE'd
+1.3 - Better API for downloading; formatting fixed
+1.4 - Syncing also removes deleted items
+1.5 - Better UI, fixed going back causing duplicate buttons
+1.6 - Toggle hiding posts you've voted on
  */
 
 (function (W, D) {
+	// if the page has already been processed, don't repeat
+	if (D.querySelector('#purge-cache'))
+		return;
+
 	// quick early exit if the user isn't logged in
 	const username = D.cookie.match(/login=([^;]+);/)[1];
 	const isDirectLink = /\/show\//.test(location.href);
@@ -81,6 +89,7 @@ Changelog:
 			this.name = name;
 			this.id = 'e621-' + name;
 			this.data = {};
+			this.BUSY = false;
 		}
 		set(id, x) {
 			this.data[id] = x;
@@ -92,6 +101,8 @@ Changelog:
 			delete this.data[id];
 		}
 		async clear() {
+			if (this.BUSY)
+				return false;
 			try {
 				console.log('Clearing', this.id, 'of data');
 				await GM.deleteValue(this.id);
@@ -103,6 +114,8 @@ Changelog:
 			}
 		}
 		async save() {
+			if (this.BUSY)
+				return false;
 			try {
 				var data = JSON.stringify(this.data) || {};
 				console.log('Saving', this.id, '->', data.length, 'bytes');
@@ -114,6 +127,8 @@ Changelog:
 			}
 		}
 		async load(data) {
+			if (this.BUSY)
+				return false;
 			try {
 				if (data)
 					console.log('Loading data from local source...');
@@ -128,25 +143,41 @@ Changelog:
 			}
 		}
 		async sync() {
-			var limit = 100,
-			page = 0,
-			acc = 0,
-			_posts,
-			p;
+			this.BUSY = true; // prevent cache reloading during sync
+			console.log('Cleaning cache...');
+			let deleted = 0;
+			for (let id in this.data) {
+				let post = await show(id);
+				if (!post || post.id != id || post.status == 'deleted') {
+					console.log('Deleting ' + id);
+					deleted++;
+					this.delete (id);
+				}
+			}
+
+			let page = 0;
+			let synced = 0;
+			let _posts;
 			do {
 				page++;
-				console.log('Fetching page', page, 'of posts...');
-				_posts = await search([`fav:${this.name}`], limit, page);
-				console.log('Received', _posts.length, 'posts.');
-				for (p of _posts) {
+				console.log('Fetching page ' + page + ' of favorites...');
+				_posts = await search([`fav:${this.name}`], 100, page);
+				console.log('Received ' + _posts.length + ' posts.');
+				for (let p of _posts) {
 					this.set(p.id, Object.assign(this.get(p.id) || {}, {
 							fave: 1
 						}));
 				}
-				acc += _posts.length;
-			} while (_posts.length == limit);
+				synced += _posts.length;
+				console.log('Synced: ' + synced);
+			} while (_posts.length == 100);
+
+			this.BUSY = false;
 			await this.save();
-			return acc;
+			return {
+				synced,
+				deleted
+			};
 		}
 		async export() {
 			download('data:application/json;base64,' + btoa(JSON.stringify(this.data)), `${this.id}.json`);
@@ -227,6 +258,15 @@ Changelog:
 	// create the page instance which will communicate with the userscript from the page
 	const page = new Page('msg');
 	const posts = {};
+	
+	// option for hiding/showing posts that the user voted on
+	var hideUpvotedPosts = false;
+	var hideDownvotedPosts = true;
+	function updateVisibility() {
+		for (var id in posts) {
+			posts[id].updateVisibility();
+		}
+	}
 
 	class Post {
 		constructor(root, id) {
@@ -263,9 +303,9 @@ Changelog:
 				this.downvote.setAttribute('id', 'votedown');
 				this.downvote.setAttribute('title', 'downvote');
 				this.favorite.setAttribute('id', 'add-to-favs');
-				this.favorite.setAttribute('title', 'add favorite');
+				this.favorite.setAttribute('title', 'fave');
 				this.unfavorite.setAttribute('id', 'remove-from-favs');
-				this.unfavorite.setAttribute('title', 'remove favorite');
+				this.unfavorite.setAttribute('title', 'unfave');
 				this.downloader.setAttribute('id', 'download');
 				this.downloader.setAttribute('title', 'download source file');
 
@@ -340,24 +380,21 @@ Changelog:
 		}
 		get data() {
 			return {
-				vote: this.vote,
-				fave: this.fave
+				v: this.vote,
+				f: this.fave
 			};
 		}
-		set data({
-			vote,
-			fave
-		}) {
-			this.vote = vote;
-			this.fave = fave;
+		set data({vote,v,fave,f}) {
+			this.vote = vote || v;
+			this.fave = fave || f;
 		}
 		async save() {
 			var data = this.data;
-			if (!data.vote)
-				delete data.vote;
-			if (!data.fave)
-				delete data.fave;
-			if (data.vote || data.fave) {
+			if (!data.v)
+				delete data.v;
+			if (!data.f)
+				delete data.f;
+			if (data.v || data.f) {
 				user.set(this.id, data);
 			} else {
 				user.delete (this.id);
@@ -366,11 +403,27 @@ Changelog:
 		}
 		load() {
 			this.data = user.get(this.id) || {};
+			this.updateVisibility();
 		}
 		async download() {
 			var post = await show(this.id);
 			var url = post.file_url;
 			window.open(url, '_blank');
+		}
+		updateVisibility() {
+			if (isDirectLink)
+				return;
+			if ((this.vote > 0 && hideUpvotedPosts) || (this.vote < 0 && hideDownvotedPosts)) {
+				this.hide();
+			} else {
+				this.show();
+			}
+		}
+		show() {
+			this.root.parentElement.style.display = '';
+		}
+		hide() {
+			this.root.parentElement.style.display = 'none';
 		}
 	}
 
@@ -382,6 +435,8 @@ Changelog:
 	/* These functions with an underscore are exported to the unsafeWindow */
 
 	async function _upvote(e) {
+		if (user.BUSY)
+			return alert('You may not vote or fave while the script is busy.');
 		var response = e.responseJSON;
 		var id = e.request.parameters.id;
 		var root = $(`#post-score-score\\ post-score-${id},#post-score-${id}`).parentElement;
@@ -397,10 +452,13 @@ Changelog:
 			post.vote = 0;
 		}
 		post.score = response.score;
+		post.updateVisibility();
 		await post.save();
 	}
 
 	async function _downvote(e) {
+		if (user.BUSY)
+			return alert('You may not vote or fave while the script is busy.');
 		var response = e.responseJSON;
 		var id = e.request.parameters.id;
 		var root = $(`#post-score-score\\ post-score-${id},#post-score-${id}`).parentElement;
@@ -416,10 +474,13 @@ Changelog:
 			post.vote = 0;
 		}
 		post.score = response.score;
+		post.updateVisibility();
 		await post.save();
 	}
 
 	async function _favorite(e) {
+		if (user.BUSY)
+			return alert('You may not vote or fave while the script is busy.');
 		var response = e.responseJSON;
 		var id = e.request.parameters.id;
 		var root = $(`#post-score-score\\ post-score-${id},#post-score-${id}`).parentElement;
@@ -438,6 +499,8 @@ Changelog:
 	}
 
 	async function _unfavorite(e) {
+		if (user.BUSY)
+			return alert('You may not vote or fave while the script is busy.');
 		var response = e.responseJSON;
 		var id = e.request.parameters.id;
 		var root = $(`#post-score-score\\ post-score-${id},#post-score-${id}`).parentElement;
@@ -464,10 +527,13 @@ Changelog:
 			return;
 		var s = $('#sync-cache');
 		s.innerHTML = 'Syncing...';
-		var total = await user.sync();
+		var {
+			synced,
+			deleted
+		} = await user.sync();
 		await load();
 		s.innerHTML = 'Sync';
-		alert(`Synced with ${total} posts`);
+		alert(`Synced with ${synced} posts and removed ${deleted} deleted items.`);
 	}
 
 	async function _saveLocal() {
@@ -490,9 +556,15 @@ Changelog:
 
 	async function load(evt, data) {
 		//console.log('Load triggered by',evt);
-		await user.load(data);
-		for (var id in posts)
-			posts[id].load();
+		if (user.BUSY)
+			return;
+		try {
+			await user.load(data);
+			for (var id in posts)
+				posts[id].load();
+		} catch (e) {
+			console.log('Unable to load:', e);
+		}
 	}
 
 	async function init() {
@@ -523,11 +595,13 @@ Changelog:
 	var container = E('div');
 	var title = E('h5');
 
+	container.id = 'msg-controls';
+
 	syncData.innerHTML = 'Sync';
 	saveData.innerHTML = 'Save';
 	loadData.innerHTML = 'Load';
 	purgeData.innerHTML = 'Clear';
-	title.innerHTML = 'MSG Cache Controls';
+	title.innerHTML = GM.info.script.name + ' v' + GM.info.script.version;
 
 	syncData.setAttribute('id', 'sync-cache');
 	saveData.setAttribute('id', 'save-cache');
@@ -545,11 +619,54 @@ Changelog:
 	page.bindEvent(loadData, 'onclick', _loadLocal);
 	page.bindEvent(purgeData, 'onclick', _purge);
 
+	const dvToggle = E('div');
+	const uvToggle = E('div');
+	dvToggle.className = 'toggle';
+	uvToggle.className = 'toggle';
+
+	const dvCheckbox = E('input');
+	dvCheckbox.id = 'toggle-dv-vis';
+	dvCheckbox.type = 'checkbox';
+	if (hideDownvotedPosts) {
+		dvCheckbox.setAttribute('checked', '');
+	}
+	dvCheckbox.addEventListener('click', function () {
+		hideDownvotedPosts = !!dvCheckbox.checked;
+		updateVisibility();
+	});
+
+	const dvLabel = E('label');
+	dvLabel.setAttribute('for', 'toggle-dv-vis');
+	dvLabel.textContent = 'Hide downvoted';
+
+	dvToggle.appendChild(dvCheckbox);
+	dvToggle.appendChild(dvLabel);
+
+	const uvCheckbox = E('input');
+	uvCheckbox.id = 'toggle-uv-vis';
+	uvCheckbox.type = 'checkbox';
+	if (hideUpvotedPosts) {
+		uvCheckbox.setAttribute('checked', '');
+	}
+	uvCheckbox.addEventListener('click', function () {
+		hideUpvotedPosts = !!uvCheckbox.checked;
+		updateVisibility();
+	});
+
+	const uvLabel = E('label');
+	uvLabel.setAttribute('for', 'toggle-uv-vis');
+	uvLabel.textContent = 'Hide upvoted';
+
+	uvToggle.appendChild(uvCheckbox);
+	uvToggle.appendChild(uvLabel);
+
 	container.appendChild(title);
 	container.appendChild(syncData);
 	container.appendChild(saveData);
 	container.appendChild(loadData);
 	container.appendChild(purgeData);
+	container.appendChild(dvToggle);
+	container.appendChild(uvToggle);
 
 	var nav = $('div.sidebar');
 	nav.insertBefore(container, nav.firstElementChild);
@@ -557,6 +674,7 @@ Changelog:
 	/* Final setup */
 
 	page.injectCSS({
+		'#voteup, #votedown, #add-to-favs, #remove-from-favs, #download': {},
 		'#voteup:hover': {
 			cursor: 'pointer',
 			color: 'green'
@@ -583,10 +701,10 @@ Changelog:
 			height: '220px !important'
 		},
 		'#cache-controls': {
-			height: '70px'
+			height: '100px'
 		},
 		'.cache-control': {
-			margin: '5px'
+			margin: '4px 6px 4px 2px'
 		},
 		'#sync-cache:hover': {
 			cursor: 'pointer',
@@ -603,6 +721,16 @@ Changelog:
 		'#purge-cache:hover': {
 			cursor: 'pointer',
 			color: 'red'
+		},
+		'input[type=checkbox]': {
+			display: 'inline',
+			'vertical-align': 'middle'
+		},
+		'.toggle': {
+			display: 'block'
+		},
+		'.toggle > label': {
+			'font-weight': 'normal'
 		}
 	});
 	page.import([_upvote, _downvote, _favorite, _unfavorite, _download, _sync, _saveLocal, _loadLocal, _purge]);
